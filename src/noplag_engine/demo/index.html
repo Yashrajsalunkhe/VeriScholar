@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>noplag-engine demo</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    max-width: 760px; margin: 0 auto; padding: 2rem 1rem 4rem;
+    color: #18181b; background: #fafafa;
+  }
+  h1 { font-size: 1.15rem; font-weight: 500; margin: 0 0 .25rem; }
+  p.note { color: #71717a; font-size: .85rem; margin: 0 0 1.5rem; }
+  textarea {
+    width: 100%; min-height: 180px; padding: .75rem; font: inherit;
+    border: 1px solid #d4d4d8; border-radius: 6px; background: #fff; resize: vertical;
+  }
+  button {
+    margin-top: .75rem; padding: .55rem 1.4rem; font: inherit; font-weight: 500;
+    color: #fafafa; background: #18181b; border: 0; border-radius: 6px; cursor: pointer;
+  }
+  button:disabled { background: #a1a1aa; cursor: default; }
+  #status { margin-left: .75rem; color: #71717a; font-size: .85rem; }
+  #result { margin-top: 2rem; display: none; }
+  .score { font-size: 2rem; font-weight: 500; }
+  .score small { font-size: .85rem; font-weight: 400; color: #71717a; margin-left: .5rem; }
+  #highlighted {
+    margin-top: 1rem; padding: 1rem; background: #fff; border: 1px solid #e4e4e7;
+    border-radius: 6px; white-space: pre-wrap; line-height: 1.55; font-size: .92rem;
+    max-height: 320px; overflow-y: auto;
+  }
+  #highlighted mark { background: #d4d4d8; border-radius: 2px; }
+  h2 { font-size: .85rem; font-weight: 500; text-transform: uppercase;
+       letter-spacing: .05em; color: #71717a; margin: 1.75rem 0 .5rem; }
+  .source {
+    display: flex; justify-content: space-between; gap: 1rem; padding: .6rem .75rem;
+    background: #fff; border: 1px solid #e4e4e7; border-radius: 6px; margin-bottom: .5rem;
+    font-size: .9rem; align-items: baseline;
+  }
+  .source a { color: #18181b; }
+  .source .pct { color: #52525b; white-space: nowrap; }
+  #error { color: #52525b; margin-top: 1rem; display: none; }
+</style>
+</head>
+<body>
+  <h1>noplag-engine demo</h1>
+  <p class="note">
+    Bare test page for the <code>/v1</code> API — paste text, run a check,
+    see matched sources. The bundled sample corpus is a small Wikipedia
+    extract: paste a paragraph from a well-known article to see a match.
+  </p>
+
+  <textarea id="text" placeholder="Paste text to check (at least a few sentences)…"></textarea>
+  <div>
+    <button id="run">Run check</button>
+    <span id="status"></span>
+  </div>
+
+  <div id="error"></div>
+
+  <div id="result">
+    <div class="score"><span id="pct"></span><small id="meta"></small></div>
+    <div id="highlighted"></div>
+    <h2>Matched sources</h2>
+    <div id="sources"></div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function esc(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderHighlights(text, passages) {
+  // passages: sorted, non-overlapping [start, end) intervals into text.
+  let html = "", cursor = 0;
+  for (const [start, end] of passages) {
+    html += esc(text.slice(cursor, start));
+    html += "<mark>" + esc(text.slice(start, end)) + "</mark>";
+    cursor = end;
+  }
+  html += esc(text.slice(cursor));
+  return html;
+}
+
+async function runCheck() {
+  const text = $("text").value.trim();
+  if (!text) return;
+  $("run").disabled = true;
+  $("result").style.display = "none";
+  $("error").style.display = "none";
+  $("status").textContent = "submitting…";
+
+  try {
+    const created = await fetch("/v1/checks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query_text: text }),
+    });
+    if (!created.ok) throw new Error((await created.json()).detail || created.statusText);
+    const { status_url, report_url } = await created.json();
+
+    let state;
+    for (;;) {
+      const res = await fetch(status_url);
+      if (!res.ok) throw new Error("status poll failed");
+      state = await res.json();
+      if (state.status === "complete" || state.status === "failed") break;
+      $("status").textContent = state.stage ? state.stage + "…" : state.status + "…";
+      await sleep(700);
+    }
+    if (state.status === "failed") throw new Error(state.error_message || "check failed");
+
+    const report = await (await fetch(report_url)).json();
+    $("pct").textContent = report.overall_similarity_pct.toFixed(1) + "% matched";
+    $("meta").textContent =
+      report.sources.length + " source" + (report.sources.length === 1 ? "" : "s") +
+      (report.corpus_sources ? " · corpus of " + report.corpus_sources.toLocaleString() + " documents" : "") +
+      (report.duration_seconds != null ? " · " + report.duration_seconds + "s" : "");
+    $("highlighted").innerHTML = renderHighlights(report.query_text || text, report.unique_passages);
+    $("sources").innerHTML = report.sources.length
+      ? report.sources.map((s) => {
+          const label = s.source_url
+            ? '<a href="' + esc(s.source_url) + '" target="_blank" rel="noopener">' +
+              esc(s.source_filename || s.source_url) + "</a>"
+            : esc(s.source_filename || s.source_document_id);
+          return '<div class="source"><span>' + label + '</span>' +
+                 '<span class="pct">' + s.similarity_pct.toFixed(1) + "%</span></div>";
+        }).join("")
+      : '<div class="source"><span>No matches found.</span></div>';
+    $("result").style.display = "block";
+    $("status").textContent = "";
+  } catch (err) {
+    $("error").textContent = "Error: " + err.message;
+    $("error").style.display = "block";
+    $("status").textContent = "";
+  } finally {
+    $("run").disabled = false;
+  }
+}
+
+$("run").addEventListener("click", runCheck);
+</script>
+</body>
+</html>

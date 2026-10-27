@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Eval corpus (downloaded, large — see eval/datasets/pan_pc_11/README.md)
+eval/datasets/pan_pc_11/external-detection-corpus/
+eval/datasets/pan_pc_11/*.zip
+eval/datasets/pan_pc_11/*.rar
+
+# Local corpus storage
+corpus-storage/

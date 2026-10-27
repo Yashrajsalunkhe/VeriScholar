@@ -1,0 +1,29 @@
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",  # line length — formatter owns this
+    # FastAPI's canonical pattern uses `Depends(...)` / `Header(...)` as
+    # function-default values everywhere a route handler is defined.
+    # B008 would flag every endpoint; ignore project-wide rather than
+    # scatter `# noqa: B008` across the api/ tree.
+    "B008",
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[format]
+quote-style = "double"
+indent-style = "space"

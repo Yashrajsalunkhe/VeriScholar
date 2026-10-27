@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "noplag-engine"
+description = "Plagiarism detection engine — winnowing-fingerprint retrieval and verbatim alignment."
+requires-python = ">=3.12"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.6",
+    "sqlalchemy[asyncio]>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+    # Sentence segmentation for the sliding-sentence chunker.
+    "pysbd>=0.3.4",
+    # Corpus ingestion: multipart uploads + text extraction.
+    "python-multipart>=0.0.9",
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    # Language detection for the fingerprinting pass.
+    "langdetect>=1.0.9",
+    # HTTP client for scholarly API integration.
+    "httpx>=0.27",
+    # Numerical arrays for semantic embeddings and FAISS.
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# Semantic detection layer (Sentence Transformers + FAISS).
+semantic = [
+    "sentence-transformers>=2.7",
+    "faiss-cpu>=1.8",
+    "torch>=2.1",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "httpx>=0.27",
+]
+
+[tool.hatch.version]
+path = "src/noplag_engine/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/noplag_engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["-ra", "--strict-markers"]
+asyncio_mode = "auto"

@@ -1,0 +1,6 @@
+TXT ingestion marker alpha.
+
+The   quick brown fox   jumps over the lazy dog.
+
+
+Second paragraph, kept distinct after normalization.
