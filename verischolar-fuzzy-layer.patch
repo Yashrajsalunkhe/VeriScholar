@@ -1,0 +1,766 @@
+From 0f1dae6a457bfcdf64673ad5c2eb70e51e1c77ce Mon Sep 17 00:00:00 2001
+From: Ajim Gulab Mujawar <ajimmujawar007@gmail.com>
+Date: Tue, 27 Oct 2026 16:23:18 +0000
+Subject: [PATCH] feat: wire the L2 fuzzy layer into the live check pipeline
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The fuzzy (L2), semantic (L3) and hybrid-scoring modules were implemented
+and unit-tested but never called by run_check — the API ran exact
+(L0/L1) detection only. A lightly paraphrased passage (synonym swaps,
+reordering) still shares winnowing fingerprints with its source, so L1
+retrieves it, but seed-extend needs a 30-char exact run to seed and finds
+none — so the source was silently dropped and the check reported 0% on
+plainly derived text. The README advertised "Exact + Fuzzy + Semantic"
+and "The L2/L3 layers now close this gap"; in the running system neither
+did.
+
+This wires L2 into run_check: for each query chunk, the candidates that
+seed-extend produced no verbatim passage for are run through the existing
+combined token/n-gram/LCS fuzzy scorer; those clearing a threshold are
+emitted as match_type="fuzzy" passages. The source is provably already in
+the candidate pool, so this adds recall without widening retrieval, needs
+no new dependencies (pure Python), and runs off the hot L1 scan path.
+
+Threshold (default 0.4) is set from the measured score distribution: it
+sits above the ~0.14 floor where independent same-topic prose scores (no
+false positives on honest work) and below the ~0.45 moderate-paraphrase
+signal. Heavy paraphrase is deliberately left to L3 — surface overlap
+cannot separate it from independent writing.
+
+New knobs on FingerprintConfig: fuzzy_enabled (NOPLAG_FUZZY_ENABLED),
+fuzzy_threshold (NOPLAG_FUZZY_THRESHOLD). Setting fuzzy_enabled=False
+reproduces the exact-only behaviour. match_type already flows through
+persistence and the API/frontend, so fuzzy evidence is distinguishable
+from verbatim with no schema change.
+
+Also:
+- Fix CI: ruff check (a required CI step) was failing on 24 errors, all
+  in the VeriScholar-added modules — unused imports, unsorted imports,
+  str+Enum -> StrEnum, raise ... from err, zip(strict=). Ignore RUF002/
+  RUF003 project-wide (deliberate typographic punctuation in prose).
+- Make the README honest: L2 is now live; L3 is implemented but not yet
+  wired into the automatic pipeline (needs a corpus embedding-index build
+  step), and heavy paraphrase remains out of scope until then.
+
+Tests: new tests/test_fuzzy_align.py (8) for the fuzzy alignment stage;
+new DB-backed workflow tests covering the paraphrase-caught,
+fuzzy-disabled-reproduces-exact, and verbatim-not-double-flagged cases.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MEyNx5HV7Xr77DFd2bsTak
+---
+ .ruff.toml                              |   7 ++
+ README.md                               |  13 ++-
+ src/noplag_engine/api/v1/scholarly.py   |   2 +-
+ src/noplag_engine/config.py             |  17 +++
+ src/noplag_engine/fuzzy/align.py        | 147 ++++++++++++++++++++++++
+ src/noplag_engine/scholarly/models.py   |   6 +-
+ src/noplag_engine/scholarly/pipeline.py |   1 -
+ src/noplag_engine/semantic/__init__.py  |  21 ++--
+ src/noplag_engine/workflows/check.py    |  46 +++++++-
+ tests/test_check_workflow.py            |  84 ++++++++++++++
+ tests/test_fuzzy_align.py               |  99 ++++++++++++++++
+ tests/test_scholarly.py                 |   1 -
+ tests/test_vs_config.py                 |   4 -
+ 13 files changed, 421 insertions(+), 27 deletions(-)
+ create mode 100644 src/noplag_engine/fuzzy/align.py
+ create mode 100644 tests/test_fuzzy_align.py
+
+diff --git a/.ruff.toml b/.ruff.toml
+index 73710a5..ab5f350 100644
+--- a/.ruff.toml
++++ b/.ruff.toml
+@@ -19,6 +19,13 @@ ignore = [
+     # B008 would flag every endpoint; ignore project-wide rather than
+     # scatter `# noqa: B008` across the api/ tree.
+     "B008",
++    # The codebase deliberately uses typographic punctuation in prose
++    # (en dashes, ×, etc.) inside docstrings and comments. RUF002/RUF003
++    # flag these as "ambiguous unicode" — a real concern inside identifiers
++    # and string literals, but noise inside human-readable prose. Ignored so
++    # documentation can read naturally without scattering noqa markers.
++    "RUF002",  # ambiguous unicode char in docstring
++    "RUF003",  # ambiguous unicode char in comment
+ ]
+ 
+ [lint.per-file-ignores]
+diff --git a/README.md b/README.md
+index 9390754..6a39e4a 100644
+--- a/README.md
++++ b/README.md
+@@ -25,7 +25,7 @@ VeriScholar AI transforms the [Noplag Engine](https://github.com/NoplagLabs/nopl
+ 
+ | Capability | Noplag Engine | VeriScholar AI |
+ |---|---|---|
+-| Detection method | Verbatim fingerprinting (L0/L1) | **Exact + Fuzzy + Semantic** (L0–L3) |
++| Detection method | Verbatim fingerprinting (L0/L1) | **Exact + Fuzzy** in the live pipeline (L0–L2); Semantic (L3) implemented, wiring tracked separately |
+ | Corpus sources | Manual upload only | **OpenAlex · arXiv · CORE · PubMed · Crossref** |
+ | Scoring | Single similarity % | **Transparent hybrid** with per-layer breakdown |
+ | Metadata | Filename only | **DOI, authors, abstract, year, journal, license** |
+@@ -84,10 +84,10 @@ The Vite dev server proxies API calls to the FastAPI backend at `:8000`.
+ 
+ 1. **L1 — Winnowing retrieval**: sentence-window chunks are reduced to [winnowing fingerprints](https://theory.stanford.edu/~aiken/publications/papers/sigmod03.pdf) stored as GIN-indexed `bigint[]` arrays in Postgres. Candidates sharing fingerprints are retrieved in bulk.
+ 2. **L0 — Seed-and-extend alignment**: hash-indexed exact substring seeding followed by tolerant lookahead extension. Produces precise character-level offsets on both sides.
+-3. **L2 — Fuzzy matching**: token Jaccard, character n-gram Dice coefficient, and LCS ratio catch near-verbatim modifications (synonym substitution, word reordering, filler insertion).
+-4. **L3 — Semantic retrieval** *(optional)*: Sentence Transformers encode passages into dense vectors, FAISS provides approximate nearest-neighbor search, optional cross-encoder reranking refines top candidates.
++3. **L2 — Fuzzy matching**: token Jaccard, character n-gram Dice coefficient, and LCS ratio catch near-verbatim modifications (synonym substitution, word reordering, filler insertion). Runs inside the live check pipeline on L1 candidates that seed-extend produced no verbatim passage for — i.e. a passage that shares fingerprints with a source but was lightly paraphrased. Matches are reported with `match_type="fuzzy"` so the evidence is distinguishable from verbatim. Toggle with `NOPLAG_FUZZY_ENABLED`; tune the reporting cutoff with `NOPLAG_FUZZY_THRESHOLD` (default `0.4`).
++4. **L3 — Semantic retrieval** *(implemented, not yet wired into the automatic pipeline)*: Sentence Transformers encode passages into dense vectors, FAISS provides approximate nearest-neighbor search, optional cross-encoder reranking refines top candidates. The `semantic/` module and `scoring/` hybrid combiner are built and unit-tested; wiring them into `run_check` requires a passage-embedding index build step over the corpus (tracked separately). Until then, heavy paraphrase and cross-language reuse remain out of scope — see Limitations.
+ 
+-All layers feed into a **transparent hybrid scorer** with configurable weights. Each layer's contribution is reported separately — no opaque "AI score."
++The verbatim (L0/L1) and fuzzy (L2) layers feed the report today; the **transparent hybrid scorer** (`scoring/`) combines per-layer evidence with configurable weights once the semantic layer is wired in. Each layer's contribution is reported separately — no opaque "AI score."
+ 
+ ## Scholarly corpus ingestion
+ 
+@@ -194,9 +194,10 @@ pip install -e ".[semantic]"  # installs sentence-transformers + faiss-cpu + tor
+ Evaluated with the standard plagdet metric on [PAN-PC-11](https://zenodo.org/records/3250095):
+ 
+ - **Verbatim / light obfuscation**: plagdet **0.8+**, precision ≥ 0.95
+-- **Heavy paraphrase / cross-language**: near zero by design (fingerprints only match near-verbatim text)
++- **Moderate paraphrase (synonym swaps, reordering)**: caught by the L2 fuzzy layer when the source still shares fingerprints — i.e. retrieval reaches it but seed-extend finds no exact run. This is the recall the fuzzy layer adds over the exact-only pipeline.
++- **Heavy paraphrase / cross-language**: still near zero. Surface token/n-gram overlap cannot separate heavy paraphrase from independently written prose on the same topic without false positives; that gap needs the L3 semantic layer, which is implemented but not yet wired into the automatic pipeline.
+ 
+-The L2 (fuzzy) and L3 (semantic) layers now close part of this gap. The eval harness is in [eval/](eval/).
++The eval harness is in [eval/](eval/).
+ 
+ ## Layout
+ 
+diff --git a/src/noplag_engine/api/v1/scholarly.py b/src/noplag_engine/api/v1/scholarly.py
+index a9c38a0..ec998f8 100644
+--- a/src/noplag_engine/api/v1/scholarly.py
++++ b/src/noplag_engine/api/v1/scholarly.py
+@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
+ from sqlalchemy import text as sql_text
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+-from noplag_engine.api.deps import get_session, get_tenant_id
++from noplag_engine.api.deps import get_session
+ from noplag_engine.db import get_sessionmaker
+ from noplag_engine.scholarly.pipeline import get_corpus_stats, run_scholarly_ingestion
+ from noplag_engine.vs_config import get_verischolar_config
+diff --git a/src/noplag_engine/config.py b/src/noplag_engine/config.py
+index 70297bf..d6a7b73 100644
+--- a/src/noplag_engine/config.py
++++ b/src/noplag_engine/config.py
+@@ -34,6 +34,16 @@ class FingerprintConfig:
+     sentences_per_chunk: int = 4
+     # Sentences shared between adjacent chunks (must be < sentences_per_chunk).
+     chunk_overlap: int = 1
++    # ── L2 fuzzy layer ──────────────────────────────────────────────
++    # Run the chunk-level fuzzy (near-verbatim) pass on L1 candidates that
++    # seed-extend produced no verbatim passage for. Catches light paraphrase
++    # (synonym swaps, reordering) that shares fingerprints with the source but
++    # no 30-char exact run. Off reproduces the original exact-only behaviour.
++    fuzzy_enabled: bool = True
++    # Minimum combined fuzzy score (0–1) for such a candidate to be reported.
++    # 0.4 catches moderate paraphrase while staying above the false-positive
++    # floor where independent same-topic writing scores; see fuzzy/align.py.
++    fuzzy_threshold: float = 0.4
+ 
+ 
+ def get_fingerprint_config() -> FingerprintConfig:
+@@ -49,4 +59,11 @@ def get_fingerprint_config() -> FingerprintConfig:
+         chunk_overlap=int(
+             os.environ.get("NOPLAG_CHUNK_OVERLAP", FingerprintConfig.chunk_overlap)
+         ),
++        fuzzy_enabled=os.environ.get(
++            "NOPLAG_FUZZY_ENABLED", "1" if FingerprintConfig.fuzzy_enabled else "0"
++        )
++        != "0",
++        fuzzy_threshold=float(
++            os.environ.get("NOPLAG_FUZZY_THRESHOLD", FingerprintConfig.fuzzy_threshold)
++        ),
+     )
+diff --git a/src/noplag_engine/fuzzy/align.py b/src/noplag_engine/fuzzy/align.py
+new file mode 100644
+index 0000000..f27b482
+--- /dev/null
++++ b/src/noplag_engine/fuzzy/align.py
+@@ -0,0 +1,147 @@
++"""L2 fuzzy alignment — chunk-level near-verbatim detection.
++
++Sits between L0/L1 (exact winnowing + seed-extend) and the L3 semantic
++layer, and closes a concrete, observable gap in the exact-only pipeline:
++
++    A query chunk that was *lightly paraphrased* from a source — a few
++    synonym substitutions, some word reordering, filler words inserted —
++    still shares enough winnowing fingerprints with that source for L1
++    retrieval to surface it as a candidate. But seed-extend needs a
++    `min_seed_len` (30-char) *exact* run to seed a passage, and once edits
++    land every few words no such run survives. The candidate reaches
++    alignment, produces zero verbatim passages, and the source silently
++    drops out of the report — the check returns 0% on text that is plainly
++    derived from the corpus.
++
++`fuzzy_align` is run on exactly those survivors: L1 candidates for a query
++chunk that seed-extend did **not** already explain with a verbatim passage.
++The source is provably in the candidate pool (it shared fingerprints), so
++this adds recall without widening retrieval. For each such candidate it
++computes a combined token/​n-gram/​LCS similarity (see ``noplag_engine.fuzzy``)
++and, when the score clears ``threshold``, emits one ``AlignedPassage`` with
++``match_type="fuzzy"`` spanning the query chunk.
++
++Why whole-chunk spans
++---------------------
++Fuzzy similarity is a chunk-to-chunk measure — it does not localise a
++character range the way exact seed-extend does. Rather than invent
++offsets, a fuzzy passage attributes the **whole query chunk** (its
++char range) to the source, which is the honest granularity of the signal:
++"this chunk reads as a paraphrase of that source chunk." Downstream
++interval-merging treats these spans exactly like verbatim ones, and the
++``match_type`` field lets the report separate the two kinds of evidence.
++
++This stage is pure-Python and dependency-free; it is deliberately kept out
++of the hot L1 scan and run only on the already-narrowed candidate set.
++"""
++
++from __future__ import annotations
++
++from uuid import UUID
++
++from noplag_engine.alignment import AlignedPassage
++from noplag_engine.fuzzy import combined_fuzzy_score
++
++# Default minimum combined fuzzy score for a candidate to be reported.
++#
++# Chosen from the measured score distribution (see test_fuzzy_align and the PR
++# notes). On a representative sentence group the combined metric separates the
++# cases cleanly:
++#
++#     identical                 1.00
++#     light edit (few synonyms) 0.82   (seed-extend already catches these)
++#     moderate paraphrase       0.45   <- the recall fuzzy exists to add
++#     heavy paraphrase          0.13   ┐ statistically indistinguishable — this
++#     independent, same topic   0.14   ┘ is the false-positive floor
++#     unrelated                 0.06
++#
++# 0.4 sits in the only safe window: above the ~0.14 floor where independent
++# writing on the same subject lives (so honest work is not flagged), below the
++# ~0.45 moderate-paraphrase signal (so real light paraphrase is caught). Heavy
++# paraphrase is deliberately *not* chased here — it cannot be told apart from
++# independent prose by surface token/n-gram overlap; that is the L3 semantic
++# layer's job, not L2's. A candidate only reaches this stage because it already
++# shared rare winnowing fingerprints with the query chunk, which further biases
++# the pool toward genuine derivations.
++DEFAULT_FUZZY_THRESHOLD = 0.4
++
++# Candidate chunks far longer or shorter than the query chunk cannot be a
++# near-verbatim paraphrase of it — a 4-sentence query chunk is not a fuzzy
++# match for a 40-sentence candidate even if the short one is a substring-ish
++# subset. Skip pairs whose length ratio is outside this band before paying for
++# the (more expensive) LCS term. Guards both runtime and precision.
++_LENGTH_RATIO_FLOOR = 0.5
++_LENGTH_RATIO_CEIL = 2.0
++
++
++def fuzzy_align(
++    query_chunk_id: UUID,
++    query_text: str,
++    candidates: list[tuple[UUID, str]],
++    *,
++    threshold: float = DEFAULT_FUZZY_THRESHOLD,
++    min_chunk_len: int = 50,
++) -> list[AlignedPassage]:
++    """Fuzzy-match `query_text` against each candidate chunk.
++
++    Parameters
++    ----------
++    query_chunk_id : UUID
++        Identifier carried through to emitted passages (the report layer
++        attributes the query side of each match with it), exactly as in
++        :func:`noplag_engine.alignment.align`.
++    query_text : str
++        Plain text of the query chunk. Emitted passages span ``[0, len)``
++        in these coordinates; the check workflow translates them to
++        full-query offsets via the chunk's ``char_start``.
++    candidates : list[tuple[UUID, str]]
++        ``(chunk_id, text)`` pairs — the L1 survivors for this query chunk
++        that seed-extend produced no verbatim passage for.
++    threshold : float
++        Minimum combined fuzzy score (0–1) to emit a passage.
++    min_chunk_len : int
++        Skip query/candidate texts shorter than this many characters;
++        fuzzy similarity on very short strings is noisy.
++
++    Returns
++    -------
++    list[AlignedPassage]
++        One passage per candidate clearing the threshold, each spanning the
++        whole query chunk, ``match_type="fuzzy"``, ``score`` = the combined
++        fuzzy similarity. Sorted by ``(-score, candidate_chunk_id)`` so the
++        strongest paraphrase evidence leads. Empty when the query is too
++        short or no candidate clears the threshold.
++    """
++    if not query_text or not candidates:
++        return []
++    q_len = len(query_text)
++    if q_len < min_chunk_len:
++        return []
++
++    scored: list[tuple[float, UUID, int]] = []
++    for candidate_chunk_id, candidate_text in candidates:
++        c_len = len(candidate_text)
++        if c_len < min_chunk_len:
++            continue
++        ratio = q_len / c_len
++        if ratio < _LENGTH_RATIO_FLOOR or ratio > _LENGTH_RATIO_CEIL:
++            continue
++        score = combined_fuzzy_score(query_text, candidate_text)
++        if score >= threshold:
++            scored.append((score, candidate_chunk_id, c_len))
++
++    scored.sort(key=lambda t: (-t[0], t[1]))
++
++    return [
++        AlignedPassage(
++            query_chunk_id=query_chunk_id,
++            candidate_chunk_id=candidate_chunk_id,
++            query_start=0,
++            query_end=q_len,
++            candidate_start=0,
++            candidate_end=c_len,
++            score=round(score, 4),
++            match_type="fuzzy",
++        )
++        for score, candidate_chunk_id, c_len in scored
++    ]
+diff --git a/src/noplag_engine/scholarly/models.py b/src/noplag_engine/scholarly/models.py
+index ce4e79a..ff27c16 100644
+--- a/src/noplag_engine/scholarly/models.py
++++ b/src/noplag_engine/scholarly/models.py
+@@ -8,10 +8,10 @@ These dataclasses carry scholarly metadata through the pipeline stages
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+-from enum import Enum
++from enum import StrEnum
+ 
+ 
+-class ScholarlySource(str, Enum):
++class ScholarlySource(StrEnum):
+     """Scholarly data sources — maps to corpus_source_type enum values."""
+     OPENALEX = "openalex"
+     ARXIV = "arxiv"
+@@ -20,7 +20,7 @@ class ScholarlySource(str, Enum):
+     CROSSREF = "crossref"
+ 
+ 
+-class AvailabilityStatus(str, Enum):
++class AvailabilityStatus(StrEnum):
+     """Full-text availability for a scholarly record."""
+     FULL_TEXT = "full_text"       # Full text retrieved and indexed
+     ABSTRACT_ONLY = "abstract"    # Only abstract available
+diff --git a/src/noplag_engine/scholarly/pipeline.py b/src/noplag_engine/scholarly/pipeline.py
+index bafbfa2..e81c347 100644
+--- a/src/noplag_engine/scholarly/pipeline.py
++++ b/src/noplag_engine/scholarly/pipeline.py
+@@ -36,7 +36,6 @@ from noplag_engine.scholarly.models import (
+     AvailabilityStatus,
+     IngestionProgress,
+     ScholarlyMetadata,
+-    ScholarlySource,
+ )
+ from noplag_engine.scholarly.openalex import OpenAlexClient
+ from noplag_engine.vs_config import ScholarlyAPIConfig
+diff --git a/src/noplag_engine/semantic/__init__.py b/src/noplag_engine/semantic/__init__.py
+index 85def10..bbffdd5 100644
+--- a/src/noplag_engine/semantic/__init__.py
++++ b/src/noplag_engine/semantic/__init__.py
+@@ -89,11 +89,11 @@ class SemanticIndex:
+                 _encoder = SentenceTransformer(
+                     self._model_name, device=self._device
+                 )
+-            except ImportError:
++            except ImportError as err:
+                 raise ImportError(
+                     "sentence-transformers is required for semantic retrieval. "
+                     "Install with: pip install sentence-transformers"
+-                )
++                ) from err
+         return _encoder
+ 
+     def _get_cross_encoder(self, model_name: str):
+@@ -104,10 +104,10 @@ class SemanticIndex:
+                 from sentence_transformers import CrossEncoder
+                 logger.info("Loading cross-encoder: %s", model_name)
+                 _cross_encoder = CrossEncoder(model_name, device=self._device)
+-            except ImportError:
++            except ImportError as err:
+                 raise ImportError(
+                     "sentence-transformers is required for cross-encoder reranking."
+-                )
++                ) from err
+         return _cross_encoder
+ 
+     def encode(self, texts: list[str]) -> np.ndarray:
+@@ -137,11 +137,11 @@ class SemanticIndex:
+         """
+         try:
+             import faiss
+-        except ImportError:
++        except ImportError as err:
+             raise ImportError(
+                 "faiss-cpu is required for semantic retrieval. "
+                 "Install with: pip install faiss-cpu"
+-            )
++            ) from err
+ 
+         n, d = embeddings.shape
+         assert d == self._embedding_dim, (
+@@ -200,7 +200,8 @@ class SemanticIndex:
+         )
+ 
+         candidates = []
+-        for score, idx in zip(scores[0], indices[0]):
++        # FAISS returns scores and indices as equal-length parallel arrays.
++        for score, idx in zip(scores[0], indices[0], strict=True):
+             if idx < 0 or idx >= len(self._id_map):
+                 continue
+             sim = float(score)  # Inner product of normalized vectors = cosine
+@@ -245,9 +246,10 @@ class SemanticIndex:
+         pairs = [(query_text, text) for _, text in candidates]
+         scores = cross_enc.predict(pairs)
+ 
++        # The cross-encoder returns exactly one score per (query, candidate) pair.
+         scored = [
+             (cand, float(score))
+-            for (cand, _text), score in zip(candidates, scores)
++            for (cand, _text), score in zip(candidates, scores, strict=True)
+         ]
+         scored.sort(key=lambda x: -x[1])
+ 
+@@ -284,8 +286,9 @@ class SemanticIndex:
+     def load(self, path: str | None = None) -> bool:
+         """Load a FAISS index from disk. Returns True on success."""
+         try:
+-            import faiss
+             import json
++
++            import faiss
+             load_path = path or self._index_path
+             index_file = f"{load_path}.index"
+             idmap_file = f"{load_path}.idmap"
+diff --git a/src/noplag_engine/workflows/check.py b/src/noplag_engine/workflows/check.py
+index 08ba209..0dbc782 100644
+--- a/src/noplag_engine/workflows/check.py
++++ b/src/noplag_engine/workflows/check.py
+@@ -69,6 +69,7 @@ from noplag_engine.alignment import AlignedPassage, align
+ from noplag_engine.chunking import chunk_document
+ from noplag_engine.config import FingerprintConfig, get_fingerprint_config
+ from noplag_engine.fingerprinting import fingerprint
++from noplag_engine.fuzzy.align import fuzzy_align
+ from noplag_engine.intervals import merge_intervals
+ from noplag_engine.retrieval import retrieve_l1_candidates  # noqa: F401  (kept: single-chunk API)
+ from noplag_engine.retrieval.l1_winnowing import (  # noqa: F401  (batched kept for callers/tests)
+@@ -213,7 +214,15 @@ async def run_check(
+     # wall-clock actually goes (chunk / fingerprint / retrieve / fetch / align /
+     # assemble) instead of guessing. Cheap (a few monotonic() reads).
+     _t = monotonic()
+-    timing = {"chunk": 0.0, "fp": 0.0, "retrieve": 0.0, "fetch": 0.0, "align": 0.0, "assemble": 0.0}
++    timing = {
++        "chunk": 0.0,
++        "fp": 0.0,
++        "retrieve": 0.0,
++        "fetch": 0.0,
++        "align": 0.0,
++        "fuzzy": 0.0,
++        "assemble": 0.0,
++    }
+ 
+     emit(ProgressEvent(stage="chunking", chunks_done=0, chunks_total=0))
+     chunks = chunk_document(
+@@ -312,14 +321,46 @@ async def run_check(
+             else:
+                 results = [_align_task(i, chunks[i].text, sub) for i, sub in align_jobs]
+ 
++            # Candidate chunks that seed-extend already explained with a
++            # verbatim passage, keyed by query chunk index. The L2 fuzzy pass
++            # below skips these — they're covered — and runs only on the
++            # candidates that shared fingerprints yet yielded no exact passage
++            # (the light-paraphrase case the exact layer silently drops).
++            verbatim_hits: dict[int, set[UUID]] = defaultdict(set)
+             for (i, _sub), passages in zip(align_jobs, results, strict=True):
+                 for passage in passages:
+                     doc_id = doc_of[passage.candidate_chunk_id]
++                    verbatim_hits[i].add(passage.candidate_chunk_id)
+                     flat.append(
+                         (doc_id, _translate_to_full_query(passage, chunks[i].char_start))
+                     )
+             timing["align"] += monotonic() - _ta
+ 
++            # Phase 2b — L2 fuzzy pass. Pure-Python, run inline on the already
++            # narrowed, uncovered candidate set (not in the hot L1 scan). Emits
++            # match_type="fuzzy" passages spanning the query chunk.
++            if cfg.fuzzy_enabled:
++                _tz = monotonic()
++                for i, cands in batch.items():
++                    uncovered = [
++                        (c.chunk_id, texts[c.chunk_id])
++                        for c in cands
++                        if c.chunk_id in texts and c.chunk_id not in verbatim_hits[i]
++                    ]
++                    if not uncovered:
++                        continue
++                    for passage in fuzzy_align(
++                        UUID(int=i),
++                        chunks[i].text,
++                        uncovered,
++                        threshold=cfg.fuzzy_threshold,
++                    ):
++                        doc_id = doc_of[passage.candidate_chunk_id]
++                        flat.append(
++                            (doc_id, _translate_to_full_query(passage, chunks[i].char_start))
++                        )
++                timing["fuzzy"] += monotonic() - _tz
++
+     coverage = "partial" if coverage_reason else "full"
+     if coverage == "full":
+         checked_chunks = chunks_total
+@@ -344,7 +385,7 @@ async def run_check(
+     # noplag.workflows.check logger.
+     logger.debug(
+         "CHECK_TIMING chunks=%d candidates=%d | chunk=%.2f fp=%.2f retrieve=%.2f "
+-        "fetch=%.2f align=%.2f assemble=%.2f total=%.2f",
++        "fetch=%.2f align=%.2f fuzzy=%.2f assemble=%.2f total=%.2f",
+         chunks_total,
+         len(flat),
+         timing["chunk"],
+@@ -352,6 +393,7 @@ async def run_check(
+         timing["retrieve"],
+         timing["fetch"],
+         timing["align"],
++        timing["fuzzy"],
+         timing["assemble"],
+         sum(timing.values()),
+     )
+diff --git a/tests/test_check_workflow.py b/tests/test_check_workflow.py
+index be00e51..95158d6 100644
+--- a/tests/test_check_workflow.py
++++ b/tests/test_check_workflow.py
+@@ -228,3 +228,87 @@ async def test_check_report_is_frozen():
+     )
+     with pytest.raises(Exception):  # noqa: B017
+         report.query_text_length = 999  # type: ignore[misc]
++
++
++# ── L2 fuzzy layer (near-verbatim / light paraphrase) ──────────────────
++
++# A source passage and a lightly-paraphrased version of it: synonym swaps
++# and reordering, same meaning. The paraphrase still shares winnowing
++# fingerprints with the source (so L1 retrieves it) but has no 30-char exact
++# run (so seed-extend alone reports nothing). This is exactly the case the
++# fuzzy layer exists to catch.
++_FUZZY_SOURCE = (
++    "Climate change poses a significant threat to global biodiversity, "
++    "altering habitats and disrupting the delicate ecological balance that "
++    "species depend upon for their continued survival across many regions. "
++    "Rising temperatures push organisms toward the poles and up mountainsides, "
++    "and those that cannot move or adapt quickly enough face local extinction."
++)
++# Reworded so that no 30-char exact run survives anywhere (seed-extend returns
++# nothing) yet 24 winnowing fingerprints still overlap (L1 surfaces the source):
++# the fuzzy layer is the *only* thing that can attribute this match.
++_FUZZY_QUERY = (
++    "Shifts in the climate pose a serious danger to biodiversity across the "
++    "globe, reshaping habitats and upsetting the fragile ecological balance on "
++    "which species rely for their lasting survival in many regions. Warming "
++    "temperatures nudge organisms poleward and to higher elevations, and any "
++    "that cannot relocate or adjust fast enough will meet local extinction."
++)
++
++
++async def test_fuzzy_layer_catches_paraphrase(session: AsyncSession):
++    """A paraphrase that seed-extend misses entirely is caught by the fuzzy layer.
++
++    The query shares winnowing fingerprints with the source (L1 retrieves it)
++    but contains no long exact run, so the verbatim seed-extend stage produces
++    nothing. Only the fuzzy layer can attribute the match.
++    """
++    from noplag_engine.config import FingerprintConfig
++
++    tenant = await _insert_tenant(session)
++    doc_id = await _ingest_document(session, tenant, _FUZZY_SOURCE)
++
++    # Explicit threshold so the test is independent of the default's tuning.
++    cfg = FingerprintConfig(fuzzy_enabled=True, fuzzy_threshold=0.35)
++    report = await run_check(_FUZZY_QUERY, session, tenant_id=tenant, config=cfg)
++
++    assert len(report.sources) == 1
++    source = report.sources[0]
++    assert source.source_document_id == doc_id
++    # The match is attributed via fuzzy passages — there are no verbatim ones.
++    match_types = {p.match_type for p in source.passages}
++    assert match_types == {"fuzzy"}
++    assert source.matched_chars > 0
++    assert report.overall_similarity_pct > 0.0
++
++
++async def test_fuzzy_disabled_reproduces_exact_only(session: AsyncSession):
++    """With the fuzzy layer off, the same paraphrase yields no match —
++    confirming the layer is what adds the recall, and that it can be
++    switched off to recover the original exact-only behaviour."""
++    from noplag_engine.config import FingerprintConfig
++
++    tenant = await _insert_tenant(session)
++    await _ingest_document(session, tenant, _FUZZY_SOURCE)
++
++    cfg = FingerprintConfig(fuzzy_enabled=False)
++    report = await run_check(_FUZZY_QUERY, session, tenant_id=tenant, config=cfg)
++
++    assert report.sources == []
++    assert report.total_matched_chars == 0
++
++
++async def test_verbatim_copy_not_double_flagged_by_fuzzy(session: AsyncSession):
++    """An exact copy is reported once, as verbatim — the fuzzy pass skips
++    candidates seed-extend already covered, so no duplicate fuzzy passage."""
++    tenant = await _insert_tenant(session)
++    await _ingest_document(session, tenant, _FUZZY_SOURCE)
++
++    report = await run_check(_FUZZY_SOURCE, session, tenant_id=tenant)
++
++    assert len(report.sources) == 1
++    source = report.sources[0]
++    assert source.similarity_pct >= 90.0
++    # Every chunk matched verbatim, so nothing should be left for fuzzy to
++    # re-flag on the same source.
++    assert all(p.match_type == "verbatim" for p in source.passages)
+diff --git a/tests/test_fuzzy_align.py b/tests/test_fuzzy_align.py
+new file mode 100644
+index 0000000..44c11b0
+--- /dev/null
++++ b/tests/test_fuzzy_align.py
+@@ -0,0 +1,99 @@
++"""Tests for the L2 fuzzy alignment stage (chunk-level near-verbatim).
++
++These exercise the detection gap fuzzy_align exists to close: text that
++shares winnowing fingerprints with a source (so L1 surfaces it) but has no
++30-char exact run for seed-extend to seed on (so the exact layer reports
++nothing). The source for each paraphrase case is verified to be a real miss
++for seed-extend in test_fuzzy_align_catches_what_seed_extend_misses.
++"""
++
++from __future__ import annotations
++
++from uuid import uuid4
++
++from noplag_engine.alignment import align
++from noplag_engine.fuzzy.align import fuzzy_align
++
++_SOURCE = (
++    "Climate change poses a significant threat to global biodiversity, "
++    "altering habitats and disrupting the delicate ecological balance that "
++    "species depend upon for their continued survival across many regions."
++)
++# Synonym substitution + reordering, same meaning and length — no long exact run.
++_PARAPHRASE = (
++    "Climate change represents a major danger to worldwide biodiversity, "
++    "changing habitats and upsetting the fragile ecological balance that "
++    "organisms rely upon for their ongoing survival across numerous regions."
++)
++
++
++def test_fuzzy_align_flags_paraphrase():
++    cid = uuid4()
++    passages = fuzzy_align(uuid4(), _PARAPHRASE, [(cid, _SOURCE)])
++    assert len(passages) == 1
++    p = passages[0]
++    assert p.match_type == "fuzzy"
++    assert p.candidate_chunk_id == cid
++    assert p.query_start == 0
++    assert p.query_end == len(_PARAPHRASE)
++    assert 0.0 < p.score <= 1.0
++
++
++def test_fuzzy_align_catches_what_seed_extend_misses():
++    """The whole point: seed-extend returns nothing on this pair, fuzzy does not."""
++    verbatim = align(uuid4(), _PARAPHRASE, [(uuid4(), _SOURCE)])
++    assert verbatim == []  # exact layer is blind to this paraphrase
++    fuzzy = fuzzy_align(uuid4(), _PARAPHRASE, [(uuid4(), _SOURCE)])
++    assert len(fuzzy) == 1  # fuzzy layer catches it
++
++
++def test_fuzzy_align_ignores_unrelated_text():
++    unrelated = (
++        "The mitochondrion is the powerhouse of the cell, generating most of "
++        "the chemical energy needed to power the cell's biochemical reactions "
++        "through the process of oxidative phosphorylation in eukaryotes."
++    )
++    passages = fuzzy_align(uuid4(), _PARAPHRASE, [(uuid4(), unrelated)])
++    assert passages == []
++
++
++def test_fuzzy_align_respects_threshold():
++    # A very high threshold rejects even a strong paraphrase.
++    strict = fuzzy_align(uuid4(), _PARAPHRASE, [(uuid4(), _SOURCE)], threshold=0.99)
++    assert strict == []
++    # A permissive one accepts it.
++    loose = fuzzy_align(uuid4(), _PARAPHRASE, [(uuid4(), _SOURCE)], threshold=0.3)
++    assert len(loose) == 1
++
++
++def test_fuzzy_align_skips_short_text():
++    assert fuzzy_align(uuid4(), "too short", [(uuid4(), _SOURCE)]) == []
++    assert fuzzy_align(uuid4(), _PARAPHRASE, [(uuid4(), "short")]) == []
++
++
++def test_fuzzy_align_skips_length_mismatch():
++    # Candidate ~5x longer than the query chunk: not a chunk-level paraphrase.
++    long_candidate = _SOURCE * 5
++    assert fuzzy_align(uuid4(), _PARAPHRASE, [(uuid4(), long_candidate)]) == []
++
++
++def test_fuzzy_align_sorts_by_score_descending():
++    near = _PARAPHRASE
++    far = (
++        "Global warming is a serious concern for the planet's many ecosystems "
++        "and the varied creatures that inhabit them in different places today."
++    )
++    cid_near, cid_far = uuid4(), uuid4()
++    passages = fuzzy_align(
++        uuid4(),
++        _PARAPHRASE,
++        [(cid_far, far), (cid_near, near)],
++        threshold=0.2,
++    )
++    scores = [p.score for p in passages]
++    assert scores == sorted(scores, reverse=True)
++
++
++def test_fuzzy_align_empty_inputs():
++    assert fuzzy_align(uuid4(), "", [(uuid4(), _SOURCE)]) == []
++    assert fuzzy_align(uuid4(), _PARAPHRASE, []) == []
+diff --git a/tests/test_scholarly.py b/tests/test_scholarly.py
+index 3903fbd..688ec09 100644
+--- a/tests/test_scholarly.py
++++ b/tests/test_scholarly.py
+@@ -4,7 +4,6 @@ from noplag_engine.scholarly.dedup import normalize_doi
+ from noplag_engine.scholarly.models import (
+     AvailabilityStatus,
+     ScholarlyMetadata,
+-    ScholarlySource,
+ )
+ from noplag_engine.scholarly.openalex import _reconstruct_abstract
+ 
+diff --git a/tests/test_vs_config.py b/tests/test_vs_config.py
+index 0bb0c0b..2846278 100644
+--- a/tests/test_vs_config.py
++++ b/tests/test_vs_config.py
+@@ -1,13 +1,9 @@
+ """Tests for the VeriScholar configuration module."""
+ 
+-import os
+ 
+ from noplag_engine.vs_config import (
+-    BrandingConfig,
+-    HybridScoringConfig,
+     ScholarlyAPIConfig,
+     SemanticConfig,
+-    SecurityConfig,
+     VeriScholarConfig,
+     get_verischolar_config,
+ )
+-- 
+2.43.0
+

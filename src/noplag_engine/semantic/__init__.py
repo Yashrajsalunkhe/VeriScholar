@@ -89,11 +89,11 @@ class SemanticIndex:
                 _encoder = SentenceTransformer(
                     self._model_name, device=self._device
                 )
-            except ImportError:
+            except ImportError as err:
                 raise ImportError(
                     "sentence-transformers is required for semantic retrieval. "
                     "Install with: pip install sentence-transformers"
-                )
+                ) from err
         return _encoder
 
     def _get_cross_encoder(self, model_name: str):
@@ -104,10 +104,10 @@ class SemanticIndex:
                 from sentence_transformers import CrossEncoder
                 logger.info("Loading cross-encoder: %s", model_name)
                 _cross_encoder = CrossEncoder(model_name, device=self._device)
-            except ImportError:
+            except ImportError as err:
                 raise ImportError(
                     "sentence-transformers is required for cross-encoder reranking."
-                )
+                ) from err
         return _cross_encoder
 
     def encode(self, texts: list[str]) -> np.ndarray:
@@ -137,11 +137,11 @@ class SemanticIndex:
         """
         try:
             import faiss
-        except ImportError:
+        except ImportError as err:
             raise ImportError(
                 "faiss-cpu is required for semantic retrieval. "
                 "Install with: pip install faiss-cpu"
-            )
+            ) from err
 
         n, d = embeddings.shape
         assert d == self._embedding_dim, (
@@ -200,7 +200,8 @@ class SemanticIndex:
         )
 
         candidates = []
-        for score, idx in zip(scores[0], indices[0]):
+        # FAISS returns scores and indices as equal-length parallel arrays.
+        for score, idx in zip(scores[0], indices[0], strict=True):
             if idx < 0 or idx >= len(self._id_map):
                 continue
             sim = float(score)  # Inner product of normalized vectors = cosine
@@ -245,9 +246,10 @@ class SemanticIndex:
         pairs = [(query_text, text) for _, text in candidates]
         scores = cross_enc.predict(pairs)
 
+        # The cross-encoder returns exactly one score per (query, candidate) pair.
         scored = [
             (cand, float(score))
-            for (cand, _text), score in zip(candidates, scores)
+            for (cand, _text), score in zip(candidates, scores, strict=True)
         ]
         scored.sort(key=lambda x: -x[1])
 
@@ -284,8 +286,9 @@ class SemanticIndex:
     def load(self, path: str | None = None) -> bool:
         """Load a FAISS index from disk. Returns True on success."""
         try:
-            import faiss
             import json
+
+            import faiss
             load_path = path or self._index_path
             index_file = f"{load_path}.index"
             idmap_file = f"{load_path}.idmap"

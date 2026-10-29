@@ -34,6 +34,16 @@ class FingerprintConfig:
     sentences_per_chunk: int = 4
     # Sentences shared between adjacent chunks (must be < sentences_per_chunk).
     chunk_overlap: int = 1
+    # ── L2 fuzzy layer ──────────────────────────────────────────────
+    # Run the chunk-level fuzzy (near-verbatim) pass on L1 candidates that
+    # seed-extend produced no verbatim passage for. Catches light paraphrase
+    # (synonym swaps, reordering) that shares fingerprints with the source but
+    # no 30-char exact run. Off reproduces the original exact-only behaviour.
+    fuzzy_enabled: bool = True
+    # Minimum combined fuzzy score (0–1) for such a candidate to be reported.
+    # 0.4 catches moderate paraphrase while staying above the false-positive
+    # floor where independent same-topic writing scores; see fuzzy/align.py.
+    fuzzy_threshold: float = 0.4
 
 
 def get_fingerprint_config() -> FingerprintConfig:
@@ -48,5 +58,12 @@ def get_fingerprint_config() -> FingerprintConfig:
         ),
         chunk_overlap=int(
             os.environ.get("NOPLAG_CHUNK_OVERLAP", FingerprintConfig.chunk_overlap)
+        ),
+        fuzzy_enabled=os.environ.get(
+            "NOPLAG_FUZZY_ENABLED", "1" if FingerprintConfig.fuzzy_enabled else "0"
+        )
+        != "0",
+        fuzzy_threshold=float(
+            os.environ.get("NOPLAG_FUZZY_THRESHOLD", FingerprintConfig.fuzzy_threshold)
         ),
     )

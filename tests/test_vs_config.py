@@ -1,13 +1,9 @@
 """Tests for the VeriScholar configuration module."""
 
-import os
 
 from noplag_engine.vs_config import (
-    BrandingConfig,
-    HybridScoringConfig,
     ScholarlyAPIConfig,
     SemanticConfig,
-    SecurityConfig,
     VeriScholarConfig,
     get_verischolar_config,
 )

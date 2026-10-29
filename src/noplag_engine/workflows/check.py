@@ -69,6 +69,7 @@ from noplag_engine.alignment import AlignedPassage, align
 from noplag_engine.chunking import chunk_document
 from noplag_engine.config import FingerprintConfig, get_fingerprint_config
 from noplag_engine.fingerprinting import fingerprint
+from noplag_engine.fuzzy.align import fuzzy_align
 from noplag_engine.intervals import merge_intervals
 from noplag_engine.retrieval import retrieve_l1_candidates  # noqa: F401  (kept: single-chunk API)
 from noplag_engine.retrieval.l1_winnowing import (  # noqa: F401  (batched kept for callers/tests)
@@ -213,7 +214,15 @@ async def run_check(
     # wall-clock actually goes (chunk / fingerprint / retrieve / fetch / align /
     # assemble) instead of guessing. Cheap (a few monotonic() reads).
     _t = monotonic()
-    timing = {"chunk": 0.0, "fp": 0.0, "retrieve": 0.0, "fetch": 0.0, "align": 0.0, "assemble": 0.0}
+    timing = {
+        "chunk": 0.0,
+        "fp": 0.0,
+        "retrieve": 0.0,
+        "fetch": 0.0,
+        "align": 0.0,
+        "fuzzy": 0.0,
+        "assemble": 0.0,
+    }
 
     emit(ProgressEvent(stage="chunking", chunks_done=0, chunks_total=0))
     chunks = chunk_document(
@@ -312,13 +321,45 @@ async def run_check(
             else:
                 results = [_align_task(i, chunks[i].text, sub) for i, sub in align_jobs]
 
+            # Candidate chunks that seed-extend already explained with a
+            # verbatim passage, keyed by query chunk index. The L2 fuzzy pass
+            # below skips these — they're covered — and runs only on the
+            # candidates that shared fingerprints yet yielded no exact passage
+            # (the light-paraphrase case the exact layer silently drops).
+            verbatim_hits: dict[int, set[UUID]] = defaultdict(set)
             for (i, _sub), passages in zip(align_jobs, results, strict=True):
                 for passage in passages:
                     doc_id = doc_of[passage.candidate_chunk_id]
+                    verbatim_hits[i].add(passage.candidate_chunk_id)
                     flat.append(
                         (doc_id, _translate_to_full_query(passage, chunks[i].char_start))
                     )
             timing["align"] += monotonic() - _ta
+
+            # Phase 2b — L2 fuzzy pass. Pure-Python, run inline on the already
+            # narrowed, uncovered candidate set (not in the hot L1 scan). Emits
+            # match_type="fuzzy" passages spanning the query chunk.
+            if cfg.fuzzy_enabled:
+                _tz = monotonic()
+                for i, cands in batch.items():
+                    uncovered = [
+                        (c.chunk_id, texts[c.chunk_id])
+                        for c in cands
+                        if c.chunk_id in texts and c.chunk_id not in verbatim_hits[i]
+                    ]
+                    if not uncovered:
+                        continue
+                    for passage in fuzzy_align(
+                        UUID(int=i),
+                        chunks[i].text,
+                        uncovered,
+                        threshold=cfg.fuzzy_threshold,
+                    ):
+                        doc_id = doc_of[passage.candidate_chunk_id]
+                        flat.append(
+                            (doc_id, _translate_to_full_query(passage, chunks[i].char_start))
+                        )
+                timing["fuzzy"] += monotonic() - _tz
 
     coverage = "partial" if coverage_reason else "full"
     if coverage == "full":
@@ -344,7 +385,7 @@ async def run_check(
     # noplag.workflows.check logger.
     logger.debug(
         "CHECK_TIMING chunks=%d candidates=%d | chunk=%.2f fp=%.2f retrieve=%.2f "
-        "fetch=%.2f align=%.2f assemble=%.2f total=%.2f",
+        "fetch=%.2f align=%.2f fuzzy=%.2f assemble=%.2f total=%.2f",
         chunks_total,
         len(flat),
         timing["chunk"],
@@ -352,6 +393,7 @@ async def run_check(
         timing["retrieve"],
         timing["fetch"],
         timing["align"],
+        timing["fuzzy"],
         timing["assemble"],
         sum(timing.values()),
     )

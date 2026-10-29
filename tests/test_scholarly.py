@@ -4,7 +4,6 @@ from noplag_engine.scholarly.dedup import normalize_doi
 from noplag_engine.scholarly.models import (
     AvailabilityStatus,
     ScholarlyMetadata,
-    ScholarlySource,
 )
 from noplag_engine.scholarly.openalex import _reconstruct_abstract
 

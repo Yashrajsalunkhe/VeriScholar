@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from noplag_engine.api.deps import get_session, get_tenant_id
+from noplag_engine.api.deps import get_session
 from noplag_engine.db import get_sessionmaker
 from noplag_engine.scholarly.pipeline import get_corpus_stats, run_scholarly_ingestion
 from noplag_engine.vs_config import get_verischolar_config

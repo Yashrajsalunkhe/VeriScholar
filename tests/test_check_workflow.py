@@ -228,3 +228,87 @@ async def test_check_report_is_frozen():
     )
     with pytest.raises(Exception):  # noqa: B017
         report.query_text_length = 999  # type: ignore[misc]
+
+
+# ── L2 fuzzy layer (near-verbatim / light paraphrase) ──────────────────
+
+# A source passage and a lightly-paraphrased version of it: synonym swaps
+# and reordering, same meaning. The paraphrase still shares winnowing
+# fingerprints with the source (so L1 retrieves it) but has no 30-char exact
+# run (so seed-extend alone reports nothing). This is exactly the case the
+# fuzzy layer exists to catch.
+_FUZZY_SOURCE = (
+    "Climate change poses a significant threat to global biodiversity, "
+    "altering habitats and disrupting the delicate ecological balance that "
+    "species depend upon for their continued survival across many regions. "
+    "Rising temperatures push organisms toward the poles and up mountainsides, "
+    "and those that cannot move or adapt quickly enough face local extinction."
+)
+# Reworded so that no 30-char exact run survives anywhere (seed-extend returns
+# nothing) yet 24 winnowing fingerprints still overlap (L1 surfaces the source):
+# the fuzzy layer is the *only* thing that can attribute this match.
+_FUZZY_QUERY = (
+    "Shifts in the climate pose a serious danger to biodiversity across the "
+    "globe, reshaping habitats and upsetting the fragile ecological balance on "
+    "which species rely for their lasting survival in many regions. Warming "
+    "temperatures nudge organisms poleward and to higher elevations, and any "
+    "that cannot relocate or adjust fast enough will meet local extinction."
+)
+
+
+async def test_fuzzy_layer_catches_paraphrase(session: AsyncSession):
+    """A paraphrase that seed-extend misses entirely is caught by the fuzzy layer.
+
+    The query shares winnowing fingerprints with the source (L1 retrieves it)
+    but contains no long exact run, so the verbatim seed-extend stage produces
+    nothing. Only the fuzzy layer can attribute the match.
+    """
+    from noplag_engine.config import FingerprintConfig
+
+    tenant = await _insert_tenant(session)
+    doc_id = await _ingest_document(session, tenant, _FUZZY_SOURCE)
+
+    # Explicit threshold so the test is independent of the default's tuning.
+    cfg = FingerprintConfig(fuzzy_enabled=True, fuzzy_threshold=0.35)
+    report = await run_check(_FUZZY_QUERY, session, tenant_id=tenant, config=cfg)
+
+    assert len(report.sources) == 1
+    source = report.sources[0]
+    assert source.source_document_id == doc_id
+    # The match is attributed via fuzzy passages — there are no verbatim ones.
+    match_types = {p.match_type for p in source.passages}
+    assert match_types == {"fuzzy"}
+    assert source.matched_chars > 0
+    assert report.overall_similarity_pct > 0.0
+
+
+async def test_fuzzy_disabled_reproduces_exact_only(session: AsyncSession):
+    """With the fuzzy layer off, the same paraphrase yields no match —
+    confirming the layer is what adds the recall, and that it can be
+    switched off to recover the original exact-only behaviour."""
+    from noplag_engine.config import FingerprintConfig
+
+    tenant = await _insert_tenant(session)
+    await _ingest_document(session, tenant, _FUZZY_SOURCE)
+
+    cfg = FingerprintConfig(fuzzy_enabled=False)
+    report = await run_check(_FUZZY_QUERY, session, tenant_id=tenant, config=cfg)
+
+    assert report.sources == []
+    assert report.total_matched_chars == 0
+
+
+async def test_verbatim_copy_not_double_flagged_by_fuzzy(session: AsyncSession):
+    """An exact copy is reported once, as verbatim — the fuzzy pass skips
+    candidates seed-extend already covered, so no duplicate fuzzy passage."""
+    tenant = await _insert_tenant(session)
+    await _ingest_document(session, tenant, _FUZZY_SOURCE)
+
+    report = await run_check(_FUZZY_SOURCE, session, tenant_id=tenant)
+
+    assert len(report.sources) == 1
+    source = report.sources[0]
+    assert source.similarity_pct >= 90.0
+    # Every chunk matched verbatim, so nothing should be left for fuzzy to
+    # re-flag on the same source.
+    assert all(p.match_type == "verbatim" for p in source.passages)

@@ -19,6 +19,13 @@ ignore = [
     # B008 would flag every endpoint; ignore project-wide rather than
     # scatter `# noqa: B008` across the api/ tree.
     "B008",
+    # The codebase deliberately uses typographic punctuation in prose
+    # (en dashes, ×, etc.) inside docstrings and comments. RUF002/RUF003
+    # flag these as "ambiguous unicode" — a real concern inside identifiers
+    # and string literals, but noise inside human-readable prose. Ignored so
+    # documentation can read naturally without scattering noqa markers.
+    "RUF002",  # ambiguous unicode char in docstring
+    "RUF003",  # ambiguous unicode char in comment
 ]
 
 [lint.per-file-ignores]

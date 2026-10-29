@@ -25,7 +25,7 @@ VeriScholar AI transforms the [Noplag Engine](https://github.com/NoplagLabs/nopl
 
 | Capability | Noplag Engine | VeriScholar AI |
 |---|---|---|
-| Detection method | Verbatim fingerprinting (L0/L1) | **Exact + Fuzzy + Semantic** (L0–L3) |
+| Detection method | Verbatim fingerprinting (L0/L1) | **Exact + Fuzzy** in the live pipeline (L0–L2); Semantic (L3) implemented, wiring tracked separately |
 | Corpus sources | Manual upload only | **OpenAlex · arXiv · CORE · PubMed · Crossref** |
 | Scoring | Single similarity % | **Transparent hybrid** with per-layer breakdown |
 | Metadata | Filename only | **DOI, authors, abstract, year, journal, license** |
@@ -84,10 +84,10 @@ The Vite dev server proxies API calls to the FastAPI backend at `:8000`.
 
 1. **L1 — Winnowing retrieval**: sentence-window chunks are reduced to [winnowing fingerprints](https://theory.stanford.edu/~aiken/publications/papers/sigmod03.pdf) stored as GIN-indexed `bigint[]` arrays in Postgres. Candidates sharing fingerprints are retrieved in bulk.
 2. **L0 — Seed-and-extend alignment**: hash-indexed exact substring seeding followed by tolerant lookahead extension. Produces precise character-level offsets on both sides.
-3. **L2 — Fuzzy matching**: token Jaccard, character n-gram Dice coefficient, and LCS ratio catch near-verbatim modifications (synonym substitution, word reordering, filler insertion).
-4. **L3 — Semantic retrieval** *(optional)*: Sentence Transformers encode passages into dense vectors, FAISS provides approximate nearest-neighbor search, optional cross-encoder reranking refines top candidates.
+3. **L2 — Fuzzy matching**: token Jaccard, character n-gram Dice coefficient, and LCS ratio catch near-verbatim modifications (synonym substitution, word reordering, filler insertion). Runs inside the live check pipeline on L1 candidates that seed-extend produced no verbatim passage for — i.e. a passage that shares fingerprints with a source but was lightly paraphrased. Matches are reported with `match_type="fuzzy"` so the evidence is distinguishable from verbatim. Toggle with `NOPLAG_FUZZY_ENABLED`; tune the reporting cutoff with `NOPLAG_FUZZY_THRESHOLD` (default `0.4`).
+4. **L3 — Semantic retrieval** *(implemented, not yet wired into the automatic pipeline)*: Sentence Transformers encode passages into dense vectors, FAISS provides approximate nearest-neighbor search, optional cross-encoder reranking refines top candidates. The `semantic/` module and `scoring/` hybrid combiner are built and unit-tested; wiring them into `run_check` requires a passage-embedding index build step over the corpus (tracked separately). Until then, heavy paraphrase and cross-language reuse remain out of scope — see Limitations.
 
-All layers feed into a **transparent hybrid scorer** with configurable weights. Each layer's contribution is reported separately — no opaque "AI score."
+The verbatim (L0/L1) and fuzzy (L2) layers feed the report today; the **transparent hybrid scorer** (`scoring/`) combines per-layer evidence with configurable weights once the semantic layer is wired in. Each layer's contribution is reported separately — no opaque "AI score."
 
 ## Scholarly corpus ingestion
 
@@ -194,9 +194,10 @@ pip install -e ".[semantic]"  # installs sentence-transformers + faiss-cpu + tor
 Evaluated with the standard plagdet metric on [PAN-PC-11](https://zenodo.org/records/3250095):
 
 - **Verbatim / light obfuscation**: plagdet **0.8+**, precision ≥ 0.95
-- **Heavy paraphrase / cross-language**: near zero by design (fingerprints only match near-verbatim text)
+- **Moderate paraphrase (synonym swaps, reordering)**: caught by the L2 fuzzy layer when the source still shares fingerprints — i.e. retrieval reaches it but seed-extend finds no exact run. This is the recall the fuzzy layer adds over the exact-only pipeline.
+- **Heavy paraphrase / cross-language**: still near zero. Surface token/n-gram overlap cannot separate heavy paraphrase from independently written prose on the same topic without false positives; that gap needs the L3 semantic layer, which is implemented but not yet wired into the automatic pipeline.
 
-The L2 (fuzzy) and L3 (semantic) layers now close part of this gap. The eval harness is in [eval/](eval/).
+The eval harness is in [eval/](eval/).
 
 ## Layout
 

@@ -36,7 +36,6 @@ from noplag_engine.scholarly.models import (
     AvailabilityStatus,
     IngestionProgress,
     ScholarlyMetadata,
-    ScholarlySource,
 )
 from noplag_engine.scholarly.openalex import OpenAlexClient
 from noplag_engine.vs_config import ScholarlyAPIConfig

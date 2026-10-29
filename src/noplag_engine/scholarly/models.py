@@ -8,10 +8,10 @@ These dataclasses carry scholarly metadata through the pipeline stages
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 
-class ScholarlySource(str, Enum):
+class ScholarlySource(StrEnum):
     """Scholarly data sources — maps to corpus_source_type enum values."""
     OPENALEX = "openalex"
     ARXIV = "arxiv"
@@ -20,7 +20,7 @@ class ScholarlySource(str, Enum):
     CROSSREF = "crossref"
 
 
-class AvailabilityStatus(str, Enum):
+class AvailabilityStatus(StrEnum):
     """Full-text availability for a scholarly record."""
     FULL_TEXT = "full_text"       # Full text retrieved and indexed
     ABSTRACT_ONLY = "abstract"    # Only abstract available
