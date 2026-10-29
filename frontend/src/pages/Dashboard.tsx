@@ -1,9 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import {
-  FileSearch, Library, TrendingUp, Clock,
-  Zap, BookOpen,
-} from 'lucide-react';
+import { FileSearch, BookOpen } from 'lucide-react';
 import { getCheckStats, getCorpusStats, type CheckStats, type CorpusStats } from '../api';
 
 export default function Dashboard() {

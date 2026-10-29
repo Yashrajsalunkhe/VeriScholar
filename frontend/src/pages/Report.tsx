@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { ArrowLeft, ExternalLink, Clock, FileText, Layers } from 'lucide-react';
+import { ArrowLeft, ExternalLink, FileText, Layers } from 'lucide-react';
 import { getCheckReport, type CheckReport } from '../api';
 import ScoreRing from '../components/ScoreRing';
 import HighlightedText from '../components/HighlightedText';

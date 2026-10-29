@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Search, Upload, RefreshCw, Library } from 'lucide-react';
+import { Search, Library } from 'lucide-react';
 import { searchCorpus, getCorpusStats, type CorpusStats } from '../api';
 
 export default function CorpusManager() {
